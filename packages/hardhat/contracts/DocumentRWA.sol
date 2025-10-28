@@ -21,6 +21,27 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
         string changeDescription;     // Description of changes made
     }
 
+    struct TemplateField {
+        string fieldName;             // Name of the field (e.g., "Title", "Date", "Amount")
+        string fieldType;             // Type of field (e.g., "text", "number", "date", "address")
+        bool isRequired;              // Whether the field is mandatory
+        string defaultValue;          // Default value for the field
+    }
+
+    struct DocumentTemplate {
+        uint256 id;                   // Unique template ID
+        string name;                  // Template name (e.g., "Invoice", "Contract")
+        string description;           // Template description
+        string category;              // Template category (e.g., "Legal", "Financial")
+        address creator;              // Template creator address
+        TemplateField[] fields;       // Array of template fields
+        string contentStructure;      // IPFS hash of template structure/layout
+        uint256 createdAt;            // Creation timestamp
+        uint256 lastModified;         // Last modification timestamp
+        bool isActive;                // Template status
+        bool isPublic;                // Whether template is publicly available
+    }
+
     struct Document {
         uint256 id;                    // Unique document ID (NFT token ID)
         address owner;                // Document owner wallet address
@@ -40,9 +61,13 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
     mapping(uint256 => Document) public documents;
     mapping(address => uint256[]) public userDocuments;
     mapping(uint256 => DocumentVersion[]) public documentVersions; // docId => version history
+    mapping(uint256 => DocumentTemplate) public templates; // templateId => template
+    mapping(address => uint256[]) public userTemplates; // user => template IDs
+    mapping(uint256 => uint256) public documentTemplate; // docId => templateId (tracks which template was used)
 
     uint256 public documentCount;
     uint256 public signatureCount;
+    uint256 public templateCount;
 
     event DocumentCreated(uint256 indexed docId, address indexed owner, uint256 indexed orgId, string title);
     event DocumentUpdated(uint256 indexed docId, string newTitle);
@@ -50,6 +75,10 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
     event SignatureVerified(uint256 indexed docId, address indexed signer, bool isValid);
     event DocumentDeleted(uint256 indexed docId);
     event VersionCreated(uint256 indexed docId, uint256 indexed versionNumber, address indexed modifiedBy, string changeDescription);
+    event TemplateCreated(uint256 indexed templateId, address indexed creator, string name);
+    event TemplateUpdated(uint256 indexed templateId, string name);
+    event TemplateDeleted(uint256 indexed templateId);
+    event DocumentCreatedFromTemplate(uint256 indexed docId, uint256 indexed templateId, address indexed owner);
 
     error DocumentNotFound();
     error Unauthorized();
@@ -60,6 +89,10 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
     error InvalidDocumentTitle();
     error VersionNotFound();
     error InvalidPagination();
+    error TemplateNotFound();
+    error InvalidTemplateName();
+    error InvalidTemplateField();
+    error TemplateNotActive();
 
     modifier onlyDocumentOwner(uint256 docId) {
         require(documents[docId].owner == msg.sender, "Only document owner");
@@ -73,6 +106,16 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
 
     modifier activeDocument(uint256 docId) {
         require(documents[docId].isActive, "Document is not active");
+        _;
+    }
+
+    modifier templateExists(uint256 templateId) {
+        require(templates[templateId].id != 0, "Template not found");
+        _;
+    }
+
+    modifier onlyTemplateCreator(uint256 templateId) {
+        require(templates[templateId].creator == msg.sender, "Only template creator");
         _;
     }
 
@@ -606,5 +649,299 @@ contract DocumentRWA is ERC721, ERC721URIStorage, Ownable {
 
         emit VersionCreated(docId, doc.currentVersion, msg.sender, changeDescription);
         emit DocumentUpdated(docId, newTitle);
+    }
+
+    // ============ Template Management Functions ============
+
+    /**
+     * @dev Create a new document template
+     * @param name Template name
+     * @param description Template description
+     * @param category Template category
+     * @param fieldNames Array of field names
+     * @param fieldTypes Array of field types
+     * @param isRequired Array indicating if fields are required
+     * @param defaultValues Array of default values for fields
+     * @param contentStructure IPFS hash of template structure
+     * @param isPublic Whether template is publicly available
+     */
+    function createTemplate(
+        string memory name,
+        string memory description,
+        string memory category,
+        string[] memory fieldNames,
+        string[] memory fieldTypes,
+        bool[] memory isRequired,
+        string[] memory defaultValues,
+        string memory contentStructure,
+        bool isPublic
+    ) external {
+        require(bytes(name).length >= 3 && bytes(name).length <= 100, "Name must be 3-100 characters");
+        require(fieldNames.length == fieldTypes.length, "Field arrays length mismatch");
+        require(fieldNames.length == isRequired.length, "Field arrays length mismatch");
+        require(fieldNames.length == defaultValues.length, "Field arrays length mismatch");
+        require(fieldNames.length > 0, "Template must have at least one field");
+        _validateIPFSHash(contentStructure);
+
+        templateCount++;
+        uint256 templateId = templateCount;
+
+        DocumentTemplate storage template = templates[templateId];
+        template.id = templateId;
+        template.name = name;
+        template.description = description;
+        template.category = category;
+        template.creator = msg.sender;
+        template.contentStructure = contentStructure;
+        template.createdAt = block.timestamp;
+        template.lastModified = block.timestamp;
+        template.isActive = true;
+        template.isPublic = isPublic;
+
+        // Add template fields
+        for (uint256 i = 0; i < fieldNames.length; i++) {
+            require(bytes(fieldNames[i]).length > 0, "Field name cannot be empty");
+            require(bytes(fieldTypes[i]).length > 0, "Field type cannot be empty");
+            
+            template.fields.push(TemplateField({
+                fieldName: fieldNames[i],
+                fieldType: fieldTypes[i],
+                isRequired: isRequired[i],
+                defaultValue: defaultValues[i]
+            }));
+        }
+
+        // Add to user's templates
+        userTemplates[msg.sender].push(templateId);
+
+        emit TemplateCreated(templateId, msg.sender, name);
+    }
+
+    /**
+     * @dev Update an existing template
+     * @param templateId Template ID
+     * @param name New template name
+     * @param description New template description
+     * @param category New template category
+     * @param contentStructure New IPFS hash of template structure
+     */
+    function updateTemplate(
+        uint256 templateId,
+        string memory name,
+        string memory description,
+        string memory category,
+        string memory contentStructure
+    )
+        external
+        templateExists(templateId)
+        onlyTemplateCreator(templateId)
+    {
+        require(bytes(name).length >= 3 && bytes(name).length <= 100, "Name must be 3-100 characters");
+        _validateIPFSHash(contentStructure);
+
+        DocumentTemplate storage template = templates[templateId];
+        require(template.isActive, "Template is not active");
+
+        template.name = name;
+        template.description = description;
+        template.category = category;
+        template.contentStructure = contentStructure;
+        template.lastModified = block.timestamp;
+
+        emit TemplateUpdated(templateId, name);
+    }
+
+    /**
+     * @dev Delete a template (soft delete)
+     * @param templateId Template ID
+     */
+    function deleteTemplate(uint256 templateId)
+        external
+        templateExists(templateId)
+        onlyTemplateCreator(templateId)
+    {
+        templates[templateId].isActive = false;
+        templates[templateId].lastModified = block.timestamp;
+
+        emit TemplateDeleted(templateId);
+    }
+
+    /**
+     * @dev Create a document from a template
+     * @param templateId Template ID to use
+     * @param organizationId Parent organization ID
+     * @param title Document title
+     * @param contentHash IPFS content hash
+     * @param metadataHash IPFS metadata hash
+     */
+    function createDocumentFromTemplate(
+        uint256 templateId,
+        uint256 organizationId,
+        string memory title,
+        string memory contentHash,
+        string memory metadataHash
+    )
+        external
+        templateExists(templateId)
+    {
+        DocumentTemplate storage template = templates[templateId];
+        require(template.isActive, "Template is not active");
+        require(
+            template.isPublic || template.creator == msg.sender,
+            "Template is private"
+        );
+
+        require(bytes(title).length >= 3 && bytes(title).length <= 100, "Title must be 3-100 characters");
+        _validateIPFSHash(contentHash);
+        _validateIPFSHash(metadataHash);
+
+        documentCount++;
+        uint256 docId = documentCount;
+
+        Document storage doc = documents[docId];
+        doc.id = docId;
+        doc.owner = msg.sender;
+        doc.organizationId = organizationId;
+        doc.title = title;
+        doc.contentHash = contentHash;
+        doc.metadataHash = metadataHash;
+        doc.createdAt = block.timestamp;
+        doc.lastModified = block.timestamp;
+        doc.currentVersion = 1;
+        doc.isActive = true;
+
+        // Track which template was used
+        documentTemplate[docId] = templateId;
+
+        // Create initial version
+        DocumentVersion memory initialVersion = DocumentVersion({
+            versionNumber: 1,
+            title: title,
+            contentHash: contentHash,
+            metadataHash: metadataHash,
+            modifiedBy: msg.sender,
+            timestamp: block.timestamp,
+            changeDescription: string(abi.encodePacked("Created from template: ", template.name))
+        });
+        documentVersions[docId].push(initialVersion);
+
+        // Mint NFT to document owner
+        _mint(msg.sender, docId);
+        _setTokenURI(docId, metadataHash);
+
+        // Add to user's documents
+        userDocuments[msg.sender].push(docId);
+
+        emit DocumentCreated(docId, msg.sender, organizationId, title);
+        emit DocumentCreatedFromTemplate(docId, templateId, msg.sender);
+    }
+
+    /**
+     * @dev Get template details
+     * @param templateId Template ID
+     * @return id Template ID
+     * @return name Template name
+     * @return description Template description
+     * @return category Template category
+     * @return creator Template creator address
+     * @return contentStructure IPFS hash of template structure
+     * @return createdAt Creation timestamp
+     * @return lastModified Last modification timestamp
+     * @return isActive Template status
+     * @return isPublic Public availability status
+     */
+    function getTemplate(uint256 templateId)
+        external
+        view
+        templateExists(templateId)
+        returns (
+            uint256 id,
+            string memory name,
+            string memory description,
+            string memory category,
+            address creator,
+            string memory contentStructure,
+            uint256 createdAt,
+            uint256 lastModified,
+            bool isActive,
+            bool isPublic
+        )
+    {
+        DocumentTemplate storage template = templates[templateId];
+        return (
+            template.id,
+            template.name,
+            template.description,
+            template.category,
+            template.creator,
+            template.contentStructure,
+            template.createdAt,
+            template.lastModified,
+            template.isActive,
+            template.isPublic
+        );
+    }
+
+    /**
+     * @dev Get template fields
+     * @param templateId Template ID
+     * @return fields Array of template fields
+     */
+    function getTemplateFields(uint256 templateId)
+        external
+        view
+        templateExists(templateId)
+        returns (TemplateField[] memory fields)
+    {
+        return templates[templateId].fields;
+    }
+
+    /**
+     * @dev Get user's templates
+     * @param user User address
+     * @return Array of template IDs
+     */
+    function getUserTemplates(address user) external view returns (uint256[] memory) {
+        return userTemplates[user];
+    }
+
+    /**
+     * @dev Get template used for a document
+     * @param docId Document ID
+     * @return templateId Template ID (0 if not created from template)
+     */
+    function getDocumentTemplate(uint256 docId)
+        external
+        view
+        documentExists(docId)
+        returns (uint256 templateId)
+    {
+        return documentTemplate[docId];
+    }
+
+    /**
+     * @dev Get total template count
+     * @return Total number of templates
+     */
+    function getTotalTemplateCount() external view returns (uint256) {
+        return templateCount;
+    }
+
+    /**
+     * @dev Toggle template public/private status
+     * @param templateId Template ID
+     */
+    function toggleTemplateVisibility(uint256 templateId)
+        external
+        templateExists(templateId)
+        onlyTemplateCreator(templateId)
+    {
+        DocumentTemplate storage template = templates[templateId];
+        require(template.isActive, "Template is not active");
+        
+        template.isPublic = !template.isPublic;
+        template.lastModified = block.timestamp;
+
+        emit TemplateUpdated(templateId, template.name);
     }
 }
